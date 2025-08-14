@@ -1,0 +1,5 @@
+fastapi==0.110.0
+uvicorn==0.23.2
+joblib
+scikit-learn
+nltk
