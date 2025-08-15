@@ -3,9 +3,9 @@ from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from nltk.sentiment import SentimentIntensityAnalyzer
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from urllib.parse import unquote
 
-# הורדת VADER אם חסר
 try:
     nltk.data.find("sentiment/vader_lexicon.zip")
 except LookupError:
@@ -17,13 +17,20 @@ sia = SentimentIntensityAnalyzer()
 
 app = FastAPI(title="Buzz Predictor API")
 
-# CORS – לאפשר חיבור מהאתר שלך
+# CORS — לאפשר את האתר שלך (אפשר גם ["*"] אבל נקשיח לדומיין של GitHub Pages)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # אפשר להחליף לדומיין האתר כשתרצה להקשיח
-    allow_methods=["*"],
+    allow_origins=["https://maxost874.github.io"],  # ← עדכן לכתובת האתר שלך
+    allow_origin_regex=r"https://.*\.github\.io",   # גיבוי לכל אתרי github.io
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
+
+# גיבוי: OPTIONS לכל נתיב (אם פרוקסי עוצר לפני ה-middleware)
+@app.options("/{full_path:path}")
+def options_catchall(full_path: str):
+    return JSONResponse({"ok": True})
 
 class PostData(BaseModel):
     text: str
@@ -36,7 +43,6 @@ def root():
 def health():
     return {"status": "ok"}
 
-# POST רגיל (ל-Power BI/לקוחות כלליים)
 @app.post("/predict")
 def predict(data: PostData):
     text = data.text
@@ -45,7 +51,6 @@ def predict(data: PostData):
     sentiment = sia.polarity_scores(text)
     return {"prediction": pred, "probability": round(proba, 4), "sentiment": sentiment}
 
-# GET נוח לאתרים סטטיים: /predict_qs?text=...
 @app.get("/predict_qs")
 def predict_qs(text: str = Query(..., min_length=1)):
     raw_text = unquote(text)
