@@ -62,34 +62,32 @@ def predict_qs(text: str = Query(..., min_length=1)):
     return {"prediction": pred, "probability": round(proba, 4), "sentiment": sentiment}
 
 
-# ===== AI Improver (rewrite — no CTA, no verbatim repeat) =====
-import re, random
-
-ADJS_EN = ["playful", "catchy", "nostalgic", "bold", "fresh", "wholesome", "cheeky", "uplifting"]
-TONES_EN = ["remix", "mini-trend", "quick reel", "throwback", "short loop", "summer vibe"]
-
-HEB_RE = re.compile(r"[\u0590-\u05FF]")
+# ===== AI Improver — English only, no CTA, no verbatim repeat =====
+COMMON_EN_STOP = {
+    "the","and","for","with","this","that","will","have","has","are","was","were","you","your",
+    "from","about","just","like","really","very","today","post","www","http","https","com","net","org"
+}
+ADJS_EN  = ["catchy","bold","fresh","playful","nostalgic","punchy","clean","uplifting","cheeky"]
+FORMATS  = ["mini-trend","quick reel","short loop","remix","throwback","snackable clip","micro edit"]
 
 def _clean(t: str) -> str:
     return re.sub(r"\s+", " ", (t or "")).strip()
 
-def _emoji_by_sent(comp: float) -> str:
-    if comp >= 0.3:  return "🔥"
-    if comp <= -0.3: return "🤔"
-    return "✨"
-
 def _keywords_en(text: str, k: int = 6):
-    # מילות מפתח פשוטות לאנגלית בלבד (בלי # או @)
     words = re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", text.lower())
-    seen, out = set(), []
+    bag = {}
     for w in words:
-        if w.startswith(("http","www")): 
+        if w in COMMON_EN_STOP or w.startswith(("http","www")):
             continue
-        if w not in seen:
-            seen.add(w); out.append(w)
-    return out[:k]
+        bag[w] = bag.get(w, 0) + 1
+    # sort by freq then length
+    keys = [w for w, _ in sorted(bag.items(), key=lambda x: (-x[1], -len(x[0])))]
+    return keys[:k]
 
-def _hashtags_from_en(keys):
+def _titlecase(s: str) -> str:
+    return s[:1].upper() + s[1:] if s else s
+
+def _hashtags(keys):
     tags = []
     for w in keys:
         w = re.sub(r"[^A-Za-z0-9]", "", w)
@@ -102,32 +100,26 @@ def _hashtags_from_en(keys):
             break
     return tags
 
-def _titlecase(s: str) -> str:
-    return s[:1].upper() + s[1:] if s else s
-
-def _make_en_variants(text: str):
-    # לא נעתיק את הטקסט המקורי; נלביש סביבו ניסוחים חדשים
+def _variants_en(text: str):
     keys = _keywords_en(text, 6)
-    subject = " ".join(keys[:2]) if keys else "the idea"
-    tone = random.choice(TONES_EN)
+    subject = " ".join(keys[:2]).strip() or "the idea"
     adj1, adj2 = random.sample(ADJS_EN, 2)
+    fmt       = random.choice(FORMATS)
 
-    v1 = f"{_titlecase(subject)} {tone} — {adj1} and fun. Tiny hook, quick cut, instant smile."
-    v2 = f"{_titlecase(subject)} reimagined: {adj2} beat, 10–15s loop, one clear moment that pops."
-    v3 = f"Short caption: Little fins, big energy. Make the rhythm do the work."
+    # שלושה נוסחים שונים שלא מחזירים את הטקסט המקורי
+    v1 = f"{_titlecase(subject)} {fmt} — {adj1}, tight pacing, one moment that pops."
+    v2 = f"{_titlecase(subject)} reimagined: {adj2} hook, 10–15s beat, keep it ultra-simple."
+    v3 = "Short caption: small setup, clear payoff. Let the rhythm do the work."
 
-    # אם אין מילים משמעותיות, ניפול לנוסחים כלליים טובים
     if not keys:
-        v1 = "Fresh take — short, punchy, and easy to share."
-        v2 = "Reimagine it as a 10–15s reel with one bold line."
-        v3 = "Keep it tiny: one vibe, one visual, one beat."
+        v1 = "Fresh take — short, punchy and easy to share."
+        v2 = "Think 10–15s with a single bold visual and a clean hook."
+        v3 = "One vibe, one beat, one moment. Keep it tiny."
 
-    # כותרת קצרה מתוך מילת המפתח/נושא
-    title = (_titlecase(subject) or "Post idea")
-    tags  = _hashtags_from_en(keys)
+    title = _titlecase(subject) if subject != "the idea" else "Post idea"
+    tags  = _hashtags(keys)
     return title, [v1, v2, v3], tags
 
-from pydantic import BaseModel
 class ImproveReq(BaseModel):
     text: str
 
@@ -137,23 +129,5 @@ def improve(req: ImproveReq):
     if len(base) < 3:
         return {"ok": False, "error": "text too short"}
 
-    sent = sia.polarity_scores(base)["compound"]
-    emo  = _emoji_by_sent(sent)
-
-    if HEB_RE.search(base):
-        # ניסוחים כלליים בעברית (ללא CTA וללא חזרה מילה במילה)
-        title = "רעיון לפוסט"
-        v1 = f"{emo} גרסה קצרה ושובבה — פתיח חד, ויז׳ואל חזק, וקצב מהיר."
-        v2 = "מחדש את הרעיון: 10–15 שניות, משפט אחד בולט ותנועה שמושכת עין."
-        v3 = "כיתוב אפשרי: קטן אבל בועט. רמיזה בטעם טוב והמשך בוידאו."
-        suggestions = [v1, v2, v3]
-        hashtags = []
-    else:
-        title, suggestions, hashtags = _make_en_variants(base)
-        # מוסיפים אמוג'י קטן לפתיחה של כל נוסח
-        suggestions = [f"{emo} {s}" for s in suggestions]
-
+    title, suggestions, hashtags = _variants_en(base)
     return {"ok": True, "title": title, "suggestions": suggestions, "hashtags": hashtags}
-
-
-
