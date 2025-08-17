@@ -53,6 +53,15 @@ def root():
 def health():
     return {"status": "ok"}
 
+@app.get("/debug_hf")
+def debug_hf():
+    return {
+        "HF_MODEL": HF_MODEL,
+        "has_token": bool(HF_TOKEN),
+        "timeout": HF_TIMEOUT
+    }
+
+
 @app.post("/predict")
 def predict(data: PostData):
     text = data.text
@@ -216,5 +225,6 @@ async def improve(req: ImproveReq):
 @app.get("/debug/hf")
 def debug_hf():
     return {"has_token": bool(HF_TOKEN), "model": HF_MODEL}
+
 
 
