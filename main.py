@@ -22,9 +22,12 @@ app = FastAPI(title="Buzz Predictor API")
 
 # === Hugging Face config ===
 HF_TOKEN = os.getenv("HF_TOKEN")                           # מגיע מה-Environment Group
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")   # אפשר לשנות לדגם אחר
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")   # אפשר לשנות לדגם אחר
 HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "45"))           # שניות
 
+print(f"[CFG] HF_MODEL={HF_MODEL}")
+print(f"[CFG] HF_TOKEN={'SET' if HF_TOKEN else 'MISSING'} len={len(HF_TOKEN or '')}")
+print(f"[CFG] HF_TIMEOUT={HF_TIMEOUT}")
 
 
 # CORS — לאפשר את האתר שלך (אפשר גם ["*"] אבל נקשיח לדומיין של GitHub Pages)
@@ -60,6 +63,16 @@ def debug_hf():
         "has_token": bool(HF_TOKEN),
         "timeout": HF_TIMEOUT
     }
+
+
+@app.get("/hf_test")
+async def hf_test():
+    """בודק קריאה אמיתית ל-Hugging Face ומחזיר תקציר/שגיאה."""
+    try:
+        out = await _hf_complete(_prompt("test"))
+        return {"ok": True, "model": HF_MODEL, "len": len(out or ""), "sample": (out or "")[:300]}
+    except Exception as e:
+        return {"ok": False, "model": HF_MODEL, "error": str(e)}
 
 
 @app.post("/predict")
@@ -221,10 +234,6 @@ async def improve(req: ImproveReq):
             "hashtags": _fallback_tags(txt),
             "detail": str(e)
         }
-
-@app.get("/debug/hf")
-def debug_hf():
-    return {"has_token": bool(HF_TOKEN), "model": HF_MODEL}
 
 
 
