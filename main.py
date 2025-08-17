@@ -22,7 +22,7 @@ app = FastAPI(title="Buzz Predictor API")
 
 # === Hugging Face config ===
 HF_TOKEN = os.getenv("HF_TOKEN")                           # מגיע מה-Environment Group
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small")   # אפשר לשנות לדגם אחר
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small").strip()   # אפשר לשנות לדגם אחר
 HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "45"))           # שניות
 
 print(f"[CFG] HF_MODEL={HF_MODEL}")
@@ -239,6 +239,7 @@ async def improve(req: ImproveReq):
             "hashtags": _fallback_tags(txt),
             "detail": str(e)
         }
+
 
 
 
