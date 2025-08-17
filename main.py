@@ -69,7 +69,7 @@ def debug_hf():
 async def hf_test():
     """בודק קריאה אמיתית ל-Hugging Face ומחזיר תקציר/שגיאה."""
     try:
-        out = await _hf_complete(_prompt("test"))
+        out = await _hf_complete(_prompt("test"))  # ← היה ("test") בלבד
         return {"ok": True, "model": HF_MODEL, "len": len(out or ""), "sample": (out or "")[:300]}
     except Exception as e:
         return {"ok": False, "model": HF_MODEL, "error": str(e)}
@@ -97,10 +97,9 @@ class ImproveReq(BaseModel):
     text: str
 
 def _prompt(text: str) -> str:
-    # מבקש החזרה כ-JSON "יבש" בלבד – הכי קל לפרסר
     return (
         "Rewrite the input for social media in English.\n"
-        "Return ONLY compact JSON with this exact schema (no prose, no extra text):\n"
+        "Return ONLY compact JSON with this exact schema (no prose, NO markdown, NO code fences):\n"
         '{"title":"<3-6 words>","variants":["<v1>","<v2>","<v3>"],"tags":["#tag1","#tag2","#tag3","#tag4","#tag5"]}\n'
         "Rules: 3 concise variants (<=20 words), no emojis, no hashtags inside variants, "
         "do not repeat the input verbatim, catchy & simple.\n"
@@ -108,40 +107,46 @@ def _prompt(text: str) -> str:
     )
 
 
+
 async def _hf_complete(prompt: str) -> str:
     if not HF_TOKEN:
         raise RuntimeError("HF_TOKEN missing")
     url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+
     payload = {
         "inputs": prompt,
         "parameters": {
-            "max_new_tokens": 220,
-            "temperature": 0.8,
+            "max_new_tokens": 120,   # היה 220
+            "temperature": 0.7,      # היה 0.8
             "top_p": 0.95,
             "return_full_text": False
         },
         "options": {"wait_for_model": True}
     }
+
     async with httpx.AsyncClient(timeout=HF_TIMEOUT) as client:
         r = await client.post(url, headers=headers, json=payload)
         r.raise_for_status()
         data = r.json()
 
-    # רוב מודלי text2text מחזירים [{"generated_text": "..."}]
     if isinstance(data, list) and data and isinstance(data[0], dict):
         return data[0].get("generated_text", "") or ""
-
-    # לעיתים מוחזר dict עם error
     if isinstance(data, dict) and "error" in data:
         raise RuntimeError(data["error"])
-
-    # גיבוי: המרה לטקסט
     return str(data) if data is not None else ""
+
 
 
 def _parse(text: str):
     text = (text or "").strip()
+    # מנקה ``` או ```json למיניהם
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL)
+    # אם יש טקסט סביב, נסה לשלוף את גוש ה-{...} האחרון
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        text = m.group(0)
+
 
     # 1) ניסיון ראשון: JSON מלא
     try:
@@ -234,6 +239,7 @@ async def improve(req: ImproveReq):
             "hashtags": _fallback_tags(txt),
             "detail": str(e)
         }
+
 
 
 
