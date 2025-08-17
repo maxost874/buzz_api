@@ -1,5 +1,6 @@
 import os, joblib, nltk
-import re, random, httpx
+import re, random, httpx, json
+
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
@@ -22,7 +23,8 @@ app = FastAPI(title="Buzz Predictor API")
 # === Hugging Face config ===
 HF_TOKEN = os.getenv("HF_TOKEN")                           # מגיע מה-Environment Group
 HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")   # אפשר לשנות לדגם אחר
-HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "25"))           # שניות
+HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "45"))           # שניות
+
 
 
 # CORS — לאפשר את האתר שלך (אפשר גם ["*"] אבל נקשיח לדומיין של GitHub Pages)
@@ -73,16 +75,16 @@ class ImproveReq(BaseModel):
     text: str
 
 def _prompt(text: str) -> str:
-    return f"""You are a sharp social media copywriter.
-Rewrite the post in English for high engagement.
-Output EXACTLY in this format (no extra text):
-title: <3-6 word catchy title>
-variant1: <first improved one-liner>
-variant2: <second improved one-liner>
-variant3: <third improved one-liner>
-tags: #tag1 #tag2 #tag3 #tag4 #tag5
+    # מבקש החזרה כ-JSON "יבש" בלבד – הכי קל לפרסר
+    return (
+        "Rewrite the input for social media in English.\n"
+        "Return ONLY compact JSON with this exact schema (no prose, no extra text):\n"
+        '{"title":"<3-6 words>","variants":["<v1>","<v2>","<v3>"],"tags":["#tag1","#tag2","#tag3","#tag4","#tag5"]}\n'
+        "Rules: 3 concise variants (<=20 words), no emojis, no hashtags inside variants, "
+        "do not repeat the input verbatim, catchy & simple.\n"
+        f"Input: {text}\nJSON:"
+    )
 
-Original: {text}"""
 
 async def _hf_complete(prompt: str) -> str:
     if not HF_TOKEN:
@@ -91,27 +93,75 @@ async def _hf_complete(prompt: str) -> str:
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {
         "inputs": prompt,
-        "parameters": {"max_new_tokens": 220, "temperature": 0.8, "top_p": 0.95},
+        "parameters": {
+            "max_new_tokens": 220,
+            "temperature": 0.8,
+            "top_p": 0.95,
+            "return_full_text": False
+        },
         "options": {"wait_for_model": True}
     }
     async with httpx.AsyncClient(timeout=HF_TIMEOUT) as client:
         r = await client.post(url, headers=headers, json=payload)
-    r.raise_for_status()
-    data = r.json()
+        r.raise_for_status()
+        data = r.json()
+
+    # רוב מודלי text2text מחזירים [{"generated_text": "..."}]
+    if isinstance(data, list) and data and isinstance(data[0], dict):
+        return data[0].get("generated_text", "") or ""
+
+    # לעיתים מוחזר dict עם error
     if isinstance(data, dict) and "error" in data:
         raise RuntimeError(data["error"])
-    return data[0].get("generated_text", "") if isinstance(data, list) else ""
+
+    # גיבוי: המרה לטקסט
+    return str(data) if data is not None else ""
+
 
 def _parse(text: str):
-    def grab(key):
-        m = re.search(rf"^{key}\s*:\s*(.*)$", text, re.IGNORECASE | re.MULTILINE)
-        return m.group(1).strip() if m else ""
-    title = grab("title")
-    variants = [grab("variant1"), grab("variant2"), grab("variant3")]
-    tags_line = grab("tags")
-    tags = re.findall(r"#\w+", tags_line)
-    variants = [v for v in variants if v]
-    return title, variants, tags
+    text = (text or "").strip()
+
+    # 1) ניסיון ראשון: JSON מלא
+    try:
+        obj = json.loads(text)
+        title = (obj.get("title") or "").strip()
+        variants = [v.strip() for v in obj.get("variants", []) if v and v.strip()]
+        tags = []
+        for t in obj.get("tags", []):
+            t = (t or "").strip()
+            if not t:
+                continue
+            if not t.startswith("#"):
+                t = "#" + re.sub(r"[^A-Za-z0-9]", "", t)
+            tags.append(t[:16])
+        return title, variants[:3], tags[:6]
+    except Exception:
+        pass
+
+    # 2) לפעמים המודל מחזיר כמה שורות, כשה-JSON באחרונה
+    for line in text.splitlines()[::-1]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            title = (obj.get("title") or "").strip()
+            variants = [v.strip() for v in obj.get("variants", []) if v and v.strip()]
+            tags = []
+            for t in obj.get("tags", []):
+                t = (t or "").strip()
+                if not t:
+                    continue
+                if not t.startswith("#"):
+                    t = "#" + re.sub(r"[^A-Za-z0-9]", "", t)
+                tags.append(t[:16])
+            return title, variants[:3], tags[:6]
+        except Exception:
+            continue
+
+    # 3) גיבוי: אם אין JSON בכלל – מחזירים ריקים כדי שה-fallback יעבוד
+    return "", [], []
+
 
 def _fallback_title(s: str) -> str:
     s = (s or "").strip()
@@ -135,19 +185,28 @@ async def improve(req: ImproveReq):
     txt = (req.text or "").strip()
     if len(txt) < 3:
         return {"ok": False, "error": "text too short"}
+
     try:
         out = await _hf_complete(_prompt(txt))
         title, variants, tags = _parse(out)
+
         if not variants:
             variants = _fallback_variants(txt)
+            src = "fallback"
+        else:
+            src = "hf"
+
         if not title:
             title = _fallback_title(txt)
         if not tags:
             tags = _fallback_tags(txt)
-        return {"ok": True, "title": title, "suggestions": variants, "hashtags": tags}
+
+        return {"ok": True, "source": src, "title": title, "suggestions": variants, "hashtags": tags}
+
     except Exception as e:
         return {
             "ok": True,
+            "source": "fallback",
             "title": _fallback_title(txt),
             "suggestions": _fallback_variants(txt),
             "hashtags": _fallback_tags(txt),
