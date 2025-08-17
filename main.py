@@ -20,16 +20,6 @@ sia = SentimentIntensityAnalyzer()
 
 app = FastAPI(title="Buzz Predictor API")
 
-# === Hugging Face config ===
-HF_TOKEN = os.getenv("HF_TOKEN")                           # מגיע מה-Environment Group
-HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-small").strip()   # אפשר לשנות לדגם אחר
-HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "45"))           # שניות
-
-print(f"[CFG] HF_MODEL={HF_MODEL}")
-print(f"[CFG] HF_TOKEN={'SET' if HF_TOKEN else 'MISSING'} len={len(HF_TOKEN or '')}")
-print(f"[CFG] HF_TIMEOUT={HF_TIMEOUT}")
-
-
 # CORS — לאפשר את האתר שלך (אפשר גם ["*"] אבל נקשיח לדומיין של GitHub Pages)
 app.add_middleware(
     CORSMiddleware,
@@ -56,25 +46,6 @@ def root():
 def health():
     return {"status": "ok"}
 
-@app.get("/debug_hf")
-def debug_hf():
-    return {
-        "HF_MODEL": HF_MODEL,
-        "has_token": bool(HF_TOKEN),
-        "timeout": HF_TIMEOUT
-    }
-
-
-@app.get("/hf_test")
-async def hf_test():
-    """בודק קריאה אמיתית ל-Hugging Face ומחזיר תקציר/שגיאה."""
-    try:
-        out = await _hf_complete(_prompt("test"))  # ← היה ("test") בלבד
-        return {"ok": True, "model": HF_MODEL, "len": len(out or ""), "sample": (out or "")[:300]}
-    except Exception as e:
-        return {"ok": False, "model": HF_MODEL, "error": str(e)}
-
-
 @app.post("/predict")
 def predict(data: PostData):
     text = data.text
@@ -91,66 +62,49 @@ def predict_qs(text: str = Query(..., min_length=1)):
     sentiment = sia.polarity_scores(raw_text)
     return {"prediction": pred, "probability": round(proba, 4), "sentiment": sentiment}
 
+# ===== AI improver via Google Gemini (English-only) =====
+from typing import Optional
+from fastapi import HTTPException
 
-# ===== AI Improver (Hugging Face) =====
-class ImproveReq(BaseModel):
-    text: str
+# ENV config (להגדיר ב-Render → Environment)
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL   = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "45"))
 
-def _prompt(text: str) -> str:
+def _prompt_en(text: str) -> str:
     return (
-        "Rewrite the input for social media in English.\n"
-        "Return ONLY compact JSON with this exact schema (no prose, NO markdown, NO code fences):\n"
+        "Rewrite the following social media post in ENGLISH.\n"
+        "Return ONLY compact JSON with EXACTLY this schema (no prose, no backticks):\n"
         '{"title":"<3-6 words>","variants":["<v1>","<v2>","<v3>"],"tags":["#tag1","#tag2","#tag3","#tag4","#tag5"]}\n'
-        "Rules: 3 concise variants (<=20 words), no emojis, no hashtags inside variants, "
-        "do not repeat the input verbatim, catchy & simple.\n"
-        f"Input: {text}\nJSON:"
+        "Rules: 3 concise variants (<=24 words each), catchy & simple, no emojis, "
+        "no hashtags inside variants, do NOT repeat the input verbatim.\n"
+        f"Post: {text}\nJSON:"
     )
 
-
-
-async def _hf_complete(prompt: str) -> str:
-    if not HF_TOKEN:
-        raise RuntimeError("HF_TOKEN missing")
-    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-
+async def _gemini_complete(prompt: str) -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY missing (set it in Render Environment).")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 120,   # היה 220
-            "temperature": 0.7,      # היה 0.8
-            "top_p": 0.95,
-            "return_full_text": False
-        },
-        "options": {"wait_for_model": True}
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.7, "topP": 0.95, "maxOutputTokens": 256},
     }
-
-    async with httpx.AsyncClient(timeout=HF_TIMEOUT) as client:
-        r = await client.post(url, headers=headers, json=payload)
+    async with httpx.AsyncClient(timeout=GEMINI_TIMEOUT) as client:
+        r = await client.post(url, json=payload)
         r.raise_for_status()
         data = r.json()
-
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0].get("generated_text", "") or ""
-    if isinstance(data, dict) and "error" in data:
-        raise RuntimeError(data["error"])
-    return str(data) if data is not None else ""
-
-
-
-def _parse(text: str):
-    text = (text or "").strip()
-    # מנקה ``` או ```json למיניהם
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.DOTALL)
-    # אם יש טקסט סביב, נסה לשלוף את גוש ה-{...} האחרון
-    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
-    if m:
-        text = m.group(0)
-
-
-    # 1) ניסיון ראשון: JSON מלא
     try:
-        obj = json.loads(text)
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except Exception:
+        raise RuntimeError(f"Bad Gemini response: {data}")
+
+def _parse_ai_json(text: str):
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.IGNORECASE | re.DOTALL)
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if m:
+        s = m.group(0)
+    try:
+        obj = json.loads(s)
         title = (obj.get("title") or "").strip()
         variants = [v.strip() for v in obj.get("variants", []) if v and v.strip()]
         tags = []
@@ -160,57 +114,31 @@ def _parse(text: str):
                 continue
             if not t.startswith("#"):
                 t = "#" + re.sub(r"[^A-Za-z0-9]", "", t)
-            tags.append(t[:16])
+            tags.append(t[:20])
         return title, variants[:3], tags[:6]
     except Exception:
-        pass
+        return "", [], []
 
-    # 2) לפעמים המודל מחזיר כמה שורות, כשה-JSON באחרונה
-    for line in text.splitlines()[::-1]:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-            title = (obj.get("title") or "").strip()
-            variants = [v.strip() for v in obj.get("variants", []) if v and v.strip()]
-            tags = []
-            for t in obj.get("tags", []):
-                t = (t or "").strip()
-                if not t:
-                    continue
-                if not t.startswith("#"):
-                    t = "#" + re.sub(r"[^A-Za-z0-9]", "", t)
-                tags.append(t[:16])
-            return title, variants[:3], tags[:6]
-        except Exception:
-            continue
-
-    # 3) גיבוי: אם אין JSON בכלל – מחזירים ריקים כדי שה-fallback יעבוד
-    return "", [], []
-
+class ImproveReq(BaseModel):
+    text: str
+    max_words: Optional[int] = 60  # לתאימות ל-frontend (לא חובה למודל)
 
 @app.post("/improve")
 async def improve(req: ImproveReq):
     txt = (req.text or "").strip()
     if len(txt) < 3:
-        return {"ok": False, "error": "text too short"}
+        raise HTTPException(400, "text too short")
+    out = await _gemini_complete(_prompt_en(txt))
+    title, variants, tags = _parse_ai_json(out)
+    if not variants:
+        return {"ok": False, "error": "Model returned no variants / JSON parse failed", "raw": (out or "")[:400]}
+    if not tags:
+        tags = [f"#{w}" for w in re.findall(r"[A-Za-z0-9]{3,}", txt.lower())[:5]]
+    return {"ok": True, "source": "gemini", "title": title or "Improved post",
+            "suggestions": variants, "hashtags": tags}
+# ===== end Gemini improver =====
 
-    try:
-        out = await _hf_complete(_prompt(txt))
-        title, variants, tags = _parse(out)
 
-        # בלי תבניות מוכנות: מחזירים שגיאה אם אין JSON מלא תקין
-        if not variants:
-            return {"ok": False, "error": "HF returned no variants / JSON parse failed", "raw": (out or "")[:400]}
-        if not title or not tags:
-            return {"ok": False, "error": "HF JSON missing title or tags", "raw": (out or "")[:400]}
-
-        return {"ok": True, "source": "hf", "title": title,
-                "suggestions": variants, "hashtags": tags}
-
-    except Exception as e:
-        return {"ok": False, "error": f"HF call failed: {e.__class__.__name__}: {e}"}
 
 
 
