@@ -212,3 +212,9 @@ async def improve(req: ImproveReq):
             "hashtags": _fallback_tags(txt),
             "detail": str(e)
         }
+
+@app.get("/debug/hf")
+def debug_hf():
+    return {"has_token": bool(HF_TOKEN), "model": HF_MODEL}
+
+
