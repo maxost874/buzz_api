@@ -190,23 +190,6 @@ def _parse(text: str):
     return "", [], []
 
 
-def _fallback_title(s: str) -> str:
-    s = (s or "").strip()
-    return (s[:32] + "…") if len(s) > 32 else (s or "Quick take")
-
-def _fallback_variants(s: str):
-    base = (s or "").strip() or "Your idea"
-    return [
-        f"{base} — catchy, tight pacing, one moment that pops.",
-        f"{base} reimagined: bold hook, 10–15s beat, keep it ultra-simple.",
-        "Short caption: small setup, clear payoff. Let the rhythm do the work."
-    ]
-
-def _fallback_tags(s: str):
-    words = [w for w in re.findall(r"[A-Za-z]{3,}", s.lower())[:2]]
-    base = ["#trend", "#viral", "#shorts", "#content", "#reels"]
-    return [f"#{w}" for w in words] + base[: max(0, 5-len(words))]
-
 @app.post("/improve")
 async def improve(req: ImproveReq):
     txt = (req.text or "").strip()
@@ -217,28 +200,19 @@ async def improve(req: ImproveReq):
         out = await _hf_complete(_prompt(txt))
         title, variants, tags = _parse(out)
 
+        # בלי תבניות מוכנות: מחזירים שגיאה אם אין JSON מלא תקין
         if not variants:
-            variants = _fallback_variants(txt)
-            src = "fallback"
-        else:
-            src = "hf"
+            return {"ok": False, "error": "HF returned no variants / JSON parse failed", "raw": (out or "")[:400]}
+        if not title or not tags:
+            return {"ok": False, "error": "HF JSON missing title or tags", "raw": (out or "")[:400]}
 
-        if not title:
-            title = _fallback_title(txt)
-        if not tags:
-            tags = _fallback_tags(txt)
-
-        return {"ok": True, "source": src, "title": title, "suggestions": variants, "hashtags": tags}
+        return {"ok": True, "source": "hf", "title": title,
+                "suggestions": variants, "hashtags": tags}
 
     except Exception as e:
-        return {
-            "ok": True,
-            "source": "fallback",
-            "title": _fallback_title(txt),
-            "suggestions": _fallback_variants(txt),
-            "hashtags": _fallback_tags(txt),
-            "detail": str(e)
-        }
+        return {"ok": False, "error": f"HF call failed: {e.__class__.__name__}: {e}"}
+
+
 
 
 
