@@ -1,5 +1,5 @@
 import os, joblib, nltk
-import re, random
+import re, random, httpx
 
 from fastapi import FastAPI, Query
 from pydantic import BaseModel
@@ -18,6 +18,12 @@ pipe = joblib.load(MODEL_PATH)
 sia = SentimentIntensityAnalyzer()
 
 app = FastAPI(title="Buzz Predictor API")
+
+# === Hugging Face config ===
+HF_TOKEN = os.getenv("HF_TOKEN")                           # מגיע מה-Environment Group
+HF_MODEL = os.getenv("HF_MODEL", "google/flan-t5-base")   # אפשר לשנות לדגם אחר
+HF_TIMEOUT = int(os.getenv("HF_TIMEOUT", "25"))           # שניות
+
 
 # CORS — לאפשר את האתר שלך (אפשר גם ["*"] אבל נקשיח לדומיין של GitHub Pages)
 app.add_middleware(
@@ -62,72 +68,88 @@ def predict_qs(text: str = Query(..., min_length=1)):
     return {"prediction": pred, "probability": round(proba, 4), "sentiment": sentiment}
 
 
-# ===== AI Improver — English only, no CTA, no verbatim repeat =====
-COMMON_EN_STOP = {
-    "the","and","for","with","this","that","will","have","has","are","was","were","you","your",
-    "from","about","just","like","really","very","today","post","www","http","https","com","net","org"
-}
-ADJS_EN  = ["catchy","bold","fresh","playful","nostalgic","punchy","clean","uplifting","cheeky"]
-FORMATS  = ["mini-trend","quick reel","short loop","remix","throwback","snackable clip","micro edit"]
-
-def _clean(t: str) -> str:
-    return re.sub(r"\s+", " ", (t or "")).strip()
-
-def _keywords_en(text: str, k: int = 6):
-    words = re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", text.lower())
-    bag = {}
-    for w in words:
-        if w in COMMON_EN_STOP or w.startswith(("http","www")):
-            continue
-        bag[w] = bag.get(w, 0) + 1
-    # sort by freq then length
-    keys = [w for w, _ in sorted(bag.items(), key=lambda x: (-x[1], -len(x[0])))]
-    return keys[:k]
-
-def _titlecase(s: str) -> str:
-    return s[:1].upper() + s[1:] if s else s
-
-def _hashtags(keys):
-    tags = []
-    for w in keys:
-        w = re.sub(r"[^A-Za-z0-9]", "", w)
-        if not w: 
-            continue
-        tag = "#" + (w if len(w) <= 15 else w[:15])
-        if tag not in tags:
-            tags.append(tag)
-        if len(tags) >= 6:
-            break
-    return tags
-
-def _variants_en(text: str):
-    keys = _keywords_en(text, 6)
-    subject = " ".join(keys[:2]).strip() or "the idea"
-    adj1, adj2 = random.sample(ADJS_EN, 2)
-    fmt       = random.choice(FORMATS)
-
-    # שלושה נוסחים שונים שלא מחזירים את הטקסט המקורי
-    v1 = f"{_titlecase(subject)} {fmt} — {adj1}, tight pacing, one moment that pops."
-    v2 = f"{_titlecase(subject)} reimagined: {adj2} hook, 10–15s beat, keep it ultra-simple."
-    v3 = "Short caption: small setup, clear payoff. Let the rhythm do the work."
-
-    if not keys:
-        v1 = "Fresh take — short, punchy and easy to share."
-        v2 = "Think 10–15s with a single bold visual and a clean hook."
-        v3 = "One vibe, one beat, one moment. Keep it tiny."
-
-    title = _titlecase(subject) if subject != "the idea" else "Post idea"
-    tags  = _hashtags(keys)
-    return title, [v1, v2, v3], tags
-
+# ===== AI Improver (Hugging Face) =====
 class ImproveReq(BaseModel):
     text: str
 
-@app.post("/improve")
-def improve(req: ImproveReq):
-    base = _clean(req.text)
-    if len(base) < 3:
-        return {"ok": False, "error": "text too short"}
+def _prompt(text: str) -> str:
+    return f"""You are a sharp social media copywriter.
+Rewrite the post in English for high engagement.
+Output EXACTLY in this format (no extra text):
+title: <3-6 word catchy title>
+variant1: <first improved one-liner>
+variant2: <second improved one-liner>
+variant3: <third improved one-liner>
+tags: #tag1 #tag2 #tag3 #tag4 #tag5
 
-    title, suggestions, hashtags = _variants_en(base)
-    return {"ok": True, "title": title, "suggestions": suggestions, "hashtags": hashtags}
+Original: {text}"""
+
+async def _hf_complete(prompt: str) -> str:
+    if not HF_TOKEN:
+        raise RuntimeError("HF_TOKEN missing")
+    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+    payload = {
+        "inputs": prompt,
+        "parameters": {"max_new_tokens": 220, "temperature": 0.8, "top_p": 0.95},
+        "options": {"wait_for_model": True}
+    }
+    async with httpx.AsyncClient(timeout=HF_TIMEOUT) as client:
+        r = await client.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, dict) and "error" in data:
+        raise RuntimeError(data["error"])
+    return data[0].get("generated_text", "") if isinstance(data, list) else ""
+
+def _parse(text: str):
+    def grab(key):
+        m = re.search(rf"^{key}\s*:\s*(.*)$", text, re.IGNORECASE | re.MULTILINE)
+        return m.group(1).strip() if m else ""
+    title = grab("title")
+    variants = [grab("variant1"), grab("variant2"), grab("variant3")]
+    tags_line = grab("tags")
+    tags = re.findall(r"#\w+", tags_line)
+    variants = [v for v in variants if v]
+    return title, variants, tags
+
+def _fallback_title(s: str) -> str:
+    s = (s or "").strip()
+    return (s[:32] + "…") if len(s) > 32 else (s or "Quick take")
+
+def _fallback_variants(s: str):
+    base = (s or "").strip() or "Your idea"
+    return [
+        f"{base} — catchy, tight pacing, one moment that pops.",
+        f"{base} reimagined: bold hook, 10–15s beat, keep it ultra-simple.",
+        "Short caption: small setup, clear payoff. Let the rhythm do the work."
+    ]
+
+def _fallback_tags(s: str):
+    words = [w for w in re.findall(r"[A-Za-z]{3,}", s.lower())[:2]]
+    base = ["#trend", "#viral", "#shorts", "#content", "#reels"]
+    return [f"#{w}" for w in words] + base[: max(0, 5-len(words))]
+
+@app.post("/improve")
+async def improve(req: ImproveReq):
+    txt = (req.text or "").strip()
+    if len(txt) < 3:
+        return {"ok": False, "error": "text too short"}
+    try:
+        out = await _hf_complete(_prompt(txt))
+        title, variants, tags = _parse(out)
+        if not variants:
+            variants = _fallback_variants(txt)
+        if not title:
+            title = _fallback_title(txt)
+        if not tags:
+            tags = _fallback_tags(txt)
+        return {"ok": True, "title": title, "suggestions": variants, "hashtags": tags}
+    except Exception as e:
+        return {
+            "ok": True,
+            "title": _fallback_title(txt),
+            "suggestions": _fallback_variants(txt),
+            "hashtags": _fallback_tags(txt),
+            "detail": str(e)
+        }
